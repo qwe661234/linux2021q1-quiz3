@@ -7,6 +7,9 @@
 #include <time.h>
 #include <unistd.h>
 
+#define TICK(X) clock_t X = clock()
+#define TOCK(X) printf("time %s: %ld sec.\n", (#X), clock() - (X))
+
 #define MAX_STR_LEN_BITS (54)
 #define MAX_STR_LEN ((1UL << MAX_STR_LEN_BITS) - 1)
 
@@ -307,6 +310,7 @@ xs *xs_copy(xs *dest, xs *src){
         dest->size = len - 1;
         dest->ptr = src->ptr;
         xs_inc_refcnt(src);
+        return dest;
     } 
     dest = xs_free(dest);
     dest->is_ptr = 1;
@@ -317,22 +321,4 @@ xs *xs_copy(xs *dest, xs *src){
     xs_allocate_data(dest, dest->size, 0);
     memcpy(xs_data(dest), xs_data(src), len);
     return dest;
-}
-
-int main(int argc, char *argv[])
-{
-    // xs string = *xs_tmp("\n foobarbar \n\n\n");
-    // xs_trim(&string, "\n ");
-    xs string = *xs_tmp("foobarbarbvailnw;qfiew");
-    xs str = *xs_tmp("aeqrgergreaeqrgergreqkgyequfhuqhfuihqfliuhewqfihuwefqlwaeqrgergreqkgyequfhuqhfuihqfliuhewqfihuwefqlwqkgyequfhuqhfuihqfliuhewqfihuwefqlwaeqrgergreqkgyequfhuqhfuihqfliuhewqfihuwefqlwaeqrgergreqkgyequfhuqhfuihqfliuhewqfihuwefqlwaeqrgergreqkgyequfhuqhfuihqfliuhewqfihuwefqlw");
-    printf("1.%s\n", xs_data(&string));
-    printf("2.%s\n", xs_data(&str));
-    str = *xs_copy(&string, &str);
-    printf("3.%s\n", xs_data(&str));
-    // printf("[%s] : %2zu\n", xs_data(&string), xs_size(&string));
-
-    // xs prefix = *xs_tmp("((("), suffix = *xs_tmp(")))");
-    // xs_concat(&string, &prefix, &suffix);
-    // printf("[%s] : %2zu\n", xs_data(&string), xs_size(&string));
-    return 0;
 }
