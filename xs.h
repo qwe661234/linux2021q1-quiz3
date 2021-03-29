@@ -8,7 +8,8 @@
 #include <unistd.h>
 
 #define TICK(X) clock_t X = clock()
-#define TOCK(X) printf("time %s: %ld sec.\n", (#X), clock() - (X))
+#define TOCK(X) clock() - X;
+#define PTIME(X) printf("total time: %ld sec.\n", X)
 
 #define MAX_STR_LEN_BITS (54)
 #define MAX_STR_LEN ((1UL << MAX_STR_LEN_BITS) - 1)
