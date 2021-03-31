@@ -1,3 +1,4 @@
+#pragma once
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -6,6 +7,14 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <errno.h>
+#include <stdarg.h>
+
+enum {
+    CSTR_PERMANENT = 1,
+    CSTR_INTERNING = 2,
+    CSTR_ONSTACK = 4,
+};
 
 #define TICK(X) clock_t X = clock()
 #define TOCK(X) clock() - X
@@ -13,8 +22,12 @@
 
 #define MAX_STR_LEN_BITS (54)
 #define MAX_STR_LEN ((1UL << MAX_STR_LEN_BITS) - 1)
-
 #define LARGE_STRING_LEN 256
+
+#define XS_INTERNING_SIZE (32)
+#define XS_STACK_SIZE (16)
+#define INTERNING_POOL_SIZE 1024
+#define HASH_START_SIZE 16
 
 typedef union {
     /* allow strings up to 15 bytes to stay on the stack
@@ -26,7 +39,10 @@ typedef union {
     char data[16];
     
     struct {
-        uint8_t filler[15],
+        uint32_t hash_size;
+        uint16_t type;
+        uint16_t ref;
+        uint8_t filler[7],
             /* how many free bytes in this stack allocated string
              * same idea as fbstring
              */
@@ -45,7 +61,44 @@ typedef union {
                       capacity : 6;
         /* the last 4 bits are important flags */
     };
+    
 } xs;
+
+struct __xs_node {
+    char buffer[XS_INTERNING_SIZE];
+    xs str;
+    struct __xs_node *next;
+};
+
+struct __xs_pool {
+    struct __xs_node node[INTERNING_POOL_SIZE];
+};
+
+struct __xs_interning {
+    int lock;
+    int index;
+    unsigned size;
+    unsigned total;
+    struct __xs_node **hash;
+    struct __xs_pool *pool;
+};
+
+static struct __xs_interning __xs_ctx;
+
+#define CSTR_LOCK()                                               \
+    ({                                                            \
+        while (__sync_lock_test_and_set(&(__xs_ctx.lock), 1)) { \
+        }                                                         \
+    })
+#define CSTR_UNLOCK() ({ __sync_lock_release(&(__xs_ctx.lock)); })
+
+static void *xalloc(size_t n)
+{
+    void *m = malloc(n);
+    if (!m)
+        exit(-1);
+    return m;
+}
 
 static inline bool xs_is_ptr(const xs *x) { return x->is_ptr; } 
 
@@ -191,6 +244,124 @@ static inline xs *xs_free(xs *x)
     return xs_newempty(x);
 }
 
+static inline void insert_node(struct __xs_node **hash,
+                               int sz,
+                               struct __xs_node *node)
+{
+    uint32_t h = node->str.hash_size;
+    int index = h & (sz - 1);
+    node->next = hash[index];
+    hash[index] = node;
+}
+
+static void expand(struct __xs_interning *si)
+{
+    unsigned new_size = si->size * 2;
+    if (new_size < HASH_START_SIZE)
+        new_size = HASH_START_SIZE;
+
+    struct __xs_node **new_hash =
+        xalloc(sizeof(struct __xs_node *) * new_size);
+    memset(new_hash, 0, sizeof(struct __xs_node *) * new_size);
+
+    for (unsigned i = 0; i < si->size; ++i) {
+        struct __xs_node *node = si->hash[i];
+        while (node) {
+            struct __xs_node *tmp = node->next;
+            insert_node(new_hash, new_size, node);
+            node = tmp;
+        }
+    }
+
+    free(si->hash);
+    si->hash = new_hash;
+    si->size = new_size;
+}
+
+static xs *interning(struct __xs_interning *si,
+                         const char *cstr,
+                         size_t sz,
+                         uint32_t hash)
+{
+    if (!si->hash)
+        return NULL;
+
+    int index = (int) (hash & (si->size - 1));
+    struct __xs_node *n = si->hash[index];
+    while (n) {
+        if (n->str.hash_size == hash) {
+            if (!strcmp(xs_data(&n->str), cstr))
+                return &n->str;
+        }
+        n = n->next;
+    }
+    // 80% (4/5) threshold
+    if (si->total * 5 >= si->size * 4)
+        return NULL;
+    if (!si->pool) {
+        si->pool = xalloc(sizeof(struct __xs_pool));
+        si->index = 0;
+    }
+    n = &si->pool->node[si->index++];
+    memcpy(n->buffer, cstr, sz);
+    n->buffer[sz] = 0;
+
+    n->str.hash_size = hash;
+    n->str.type = CSTR_INTERNING;
+    n->str.ref = 0;
+    
+    size_t len = strlen(n->buffer);
+    if (len < 16) {
+        strncpy(n->str.data, n->buffer, len);
+        n->str.space_left = 15 - (len - 1); 
+    }else{
+        n->str.capacity = ilog2(len) + 1;
+        n->str.size = len - 1;
+        n->str.is_ptr = true;
+        xs_allocate_data(&n->str, n->str.size, 0);
+        memcpy(xs_data(&n->str), n->buffer, len);
+    }
+    
+
+    n->next = si->hash[index];
+    si->hash[index] = n;
+
+    return &n->str;
+}
+
+static xs *cstr_interning(const char *cstr, size_t sz, uint32_t hash)
+{
+    xs *ret;
+    CSTR_LOCK();
+    ret = interning(&__xs_ctx, cstr, sz, hash);
+    if (!ret) {
+        expand(&__xs_ctx);
+        ret = interning(&__xs_ctx, cstr, sz, hash);
+    }
+    ++__xs_ctx.total;
+    CSTR_UNLOCK();
+    return ret;
+}
+
+static inline uint32_t hash_blob(const char *buffer, size_t len)
+{
+    const uint8_t *ptr = (const uint8_t *) buffer;
+    size_t h = len;
+    size_t step = (len >> 5) + 1;
+    for (size_t i = len; i >= step; i -= step)
+        h = h ^ ((h << 5) + (h >> 2) + ptr[i - 1]);
+    return h == 0 ? 1 : h;
+}
+
+static size_t xs_hash(xs *s)
+{
+    if (s->type == CSTR_ONSTACK)
+        return hash_blob(xs_data(s), s->hash_size);
+    if (s->hash_size == 0)
+        s->hash_size = hash_blob(xs_data(s), strlen(xs_data(s)));
+    return s->hash_size;
+}
+
 static bool xs_cow_lazy_copy(xs *x, char **data)
 {
     if (xs_get_refcnt(x) <= 1)
@@ -209,7 +380,7 @@ static bool xs_cow_lazy_copy(xs *x, char **data)
     return true;
 }
 
-//change
+//interning
 xs *xs_concat(xs *string, const xs *prefix, const xs *suffix)
 {
     size_t pres = xs_size(prefix), sufs = xs_size(suffix),
@@ -224,10 +395,12 @@ xs *xs_concat(xs *string, const xs *prefix, const xs *suffix)
         memmove(data + pres, data, size);
         memcpy(data, pre, pres);
         memcpy(data + pres + size, suf, sufs + 1);
-
-        if (xs_is_ptr(string))
+        if (xs_is_ptr(string)) {
             string->size = size + pres + sufs;
-        else
+            if (size + pres + sufs < XS_INTERNING_SIZE) {
+                return cstr_interning(data, size + pres + sufs, hash_blob(data, size + pres + sufs));
+            }
+        } else
             string->space_left = 15 - (size + pres + sufs);
     } else {
         xs tmps = xs_literal_empty();
@@ -239,11 +412,14 @@ xs *xs_concat(xs *string, const xs *prefix, const xs *suffix)
         xs_free(string);
         *string = tmps;
         string->size = size + pres + sufs;
+        if (size + pres + sufs < XS_INTERNING_SIZE) {
+             return cstr_interning(data, size + pres + sufs, hash_blob(data, size + pres + sufs));
+        }
     }
     return string;
 }
 
-//change
+//interning
 xs *xs_trim(xs *x, const char *trimset)
 {
     if (!trimset[0])
@@ -281,16 +457,18 @@ xs *xs_trim(xs *x, const char *trimset)
     /* do not dirty memory unless it is needed */
     if (orig[slen])
         orig[slen] = 0;
-
     if (xs_is_ptr(x))
         x->size = slen;
     else
         x->space_left = 15 - slen;
+    if (slen < XS_INTERNING_SIZE) {
+        return cstr_interning(orig, slen, hash_blob(orig, slen));
+    }
     return x;
 #undef check_bit
 #undef set_bit
 }
-
+// interning
 xs *xs_copy(xs *dest, xs *src){
     /* short string */
     if (!xs_is_ptr(src)){
@@ -298,10 +476,7 @@ xs *xs_copy(xs *dest, xs *src){
         dest->is_large_string = 0;
         dest->is_ptr = 0;
         dest->space_left = src->space_left;
-        memcpy(dest->data, src->data, xs_size(dest));
-        if (dest->data[xs_size(dest)]){
-            dest->data[xs_size(dest)] = 0;
-        }
+        memcpy(dest->data, src->data, xs_size(src));
         return dest;
     }
     /* large string */
@@ -324,5 +499,8 @@ xs *xs_copy(xs *dest, xs *src){
     dest->size = len - 1;
     xs_allocate_data(dest, dest->size, 0);
     memcpy(xs_data(dest), xs_data(src), len);
+    if (len < XS_INTERNING_SIZE) {
+        dest->ptr = cstr_interning(xs_data(src), xs_size(src), hash_blob(xs_data(src), xs_size(src)))->ptr;
+    }
     return dest;
 }
