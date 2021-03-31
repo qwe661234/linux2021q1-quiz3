@@ -8,8 +8,8 @@
 #include <unistd.h>
 
 #define TICK(X) clock_t X = clock()
-#define TOCK(X) clock() - X;
-#define PTIME(X) printf("total time: %ld sec.\n", X)
+#define TOCK(X) clock() - X
+#define PTIME(X) printf("%ld\n", X)
 
 #define MAX_STR_LEN_BITS (54)
 #define MAX_STR_LEN ((1UL << MAX_STR_LEN_BITS) - 1)
@@ -46,7 +46,6 @@ typedef union {
         /* the last 4 bits are important flags */
     };
 } xs;
-// 搞懂 reference counter
 
 static inline bool xs_is_ptr(const xs *x) { return x->is_ptr; } 
 
@@ -127,6 +126,7 @@ static void xs_allocate_data(xs *x, size_t len, bool reallocate)
     xs_set_refcnt(x, 1);
 }
 
+//change
 xs *xs_new(xs *x, const void *p)
 {
     *x = xs_literal_empty();
@@ -209,6 +209,7 @@ static bool xs_cow_lazy_copy(xs *x, char **data)
     return true;
 }
 
+//change
 xs *xs_concat(xs *string, const xs *prefix, const xs *suffix)
 {
     size_t pres = xs_size(prefix), sufs = xs_size(suffix),
@@ -242,6 +243,7 @@ xs *xs_concat(xs *string, const xs *prefix, const xs *suffix)
     return string;
 }
 
+//change
 xs *xs_trim(xs *x, const char *trimset)
 {
     if (!trimset[0])
@@ -274,6 +276,7 @@ xs *xs_trim(xs *x, const char *trimset)
      * Do not reallocate immediately. Instead, reuse it as possible.
      * Do not shrink to in place if < 16 bytes.
      */
+    // memmove is safer than memcpy
     memmove(orig, dataptr, slen);
     /* do not dirty memory unless it is needed */
     if (orig[slen])

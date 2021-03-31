@@ -12,6 +12,8 @@
         "unordered_map": "c",
         "utility": "c",
         "vector": "c",
-        "xs.h": "c"
+        "xs.h": "c",
+        "string.h": "c",
+        "stdlib.h": "c"
     }
 }
