@@ -24,7 +24,7 @@ enum {
 #define MAX_STR_LEN ((1UL << MAX_STR_LEN_BITS) - 1)
 #define LARGE_STRING_LEN 256
 
-#define XS_INTERNING_SIZE (32)
+#define XS_INTERNING_SIZE (256)
 #define XS_STACK_SIZE (16)
 #define INTERNING_POOL_SIZE 1024
 #define HASH_START_SIZE 16
@@ -37,12 +37,9 @@ typedef union {
      */
     /* store short string */ 
     char data[16];
-    
+
     struct {
-        uint32_t hash_size;
-        uint16_t type;
-        uint16_t ref;
-        uint8_t filler[7],
+        uint8_t filler[15],
             /* how many free bytes in this stack allocated string
              * same idea as fbstring
              */
@@ -65,8 +62,9 @@ typedef union {
 } xs;
 
 struct __xs_node {
-    char buffer[XS_INTERNING_SIZE];
     xs str;
+    char* buffer;
+    uint32_t hash_size;
     struct __xs_node *next;
 };
 
@@ -179,23 +177,128 @@ static void xs_allocate_data(xs *x, size_t len, bool reallocate)
     xs_set_refcnt(x, 1);
 }
 
-//change
-xs *xs_new(xs *x, const void *p)
+static inline void insert_node(struct __xs_node **hash,
+                               int sz,
+                               struct __xs_node *node)
 {
-    *x = xs_literal_empty();
-    size_t len = strlen(p) + 1;
-    if (len > 16) {
-        x->capacity = ilog2(len) + 1;
-        x->size = len - 1;
-        x->is_ptr = true;
-        xs_allocate_data(x, x->size, 0);
-        memcpy(xs_data(x), p, len);
-    } else {
-        memcpy(x->data, p, len);
-        x->space_left = 15 - (len - 1);
-    }
-    return x;
+    uint32_t h = node->hash_size;
+    int index = h & (sz - 1);
+    node->next = hash[index];
+    hash[index] = node;
 }
+
+static void expand(struct __xs_interning *si)
+{
+    unsigned new_size = si->size * 2;
+    if (new_size < HASH_START_SIZE)
+        new_size = HASH_START_SIZE;
+
+    struct __xs_node **new_hash =
+        xalloc(sizeof(struct __xs_node *) * new_size);
+    memset(new_hash, 0, sizeof(struct __xs_node *) * new_size);
+
+    for (unsigned i = 0; i < si->size; ++i) {
+        struct __xs_node *node = si->hash[i];
+        while (node) {
+            struct __xs_node *tmp = node->next;
+            insert_node(new_hash, new_size, node);
+            node = tmp;
+        }
+    }
+
+    free(si->hash);
+    si->hash = new_hash;
+    si->size = new_size;
+}
+
+static xs *interning(struct __xs_interning *si,
+                         const char *cstr,
+                        size_t sz,
+                         uint32_t hash);
+// {
+//     if (!si->hash)
+//         return NULL;
+
+//     int index = (int) (hash & (si->size - 1));
+//     struct __xs_node *n = si->hash[index];
+//     while (n) {
+//         if (n->hash_size == hash) {
+//             if (!strcmp(xs_data(&n->str), cstr))
+// 				n->interning_ref ++;
+//                 return &n->str;
+//         }
+//         n = n->next;
+//     }
+//     // 80% (4/5) threshold
+//     if (si->total * 5 >= si->size * 4)
+//         return NULL;
+//     if (!si->pool) {
+//         si->pool = xalloc(sizeof(struct __xs_pool));
+//         si->index = 0;
+//     }
+//     n = &si->pool->node[si->index++];
+// 	n->buffer = xalloc(sz);
+//     memcpy(n->buffer, cstr, sz);
+//     n->buffer[sz] = 0;
+
+// 	n->hash_size = hash;
+// 	n->interning_ref = 0;
+//     n->str.capacity = ilog2(sz) + 1;
+//     n->str.size = sz;
+//     n->str.is_ptr = true;
+// 	xs *xsptr = &n->str;
+// 	xsptr->ptr = n->buffer;
+	
+//     n->next = si->hash[index];
+//     si->hash[index] = n;
+
+//     return xsptr;
+// } 
+
+static xs *cstr_interning(const char *cstr, size_t sz, uint32_t hash);
+// {
+//     xs *ret;
+//     CSTR_LOCK();
+//     ret = interning(&__xs_ctx, cstr, sz, hash);
+//     if (!ret) {
+//         expand(&__xs_ctx);
+//         ret = interning(&__xs_ctx, cstr, sz, hash);
+//     }
+//     ++__xs_ctx.total;
+//     CSTR_UNLOCK();
+//     return ret;
+// }
+
+static inline uint32_t hash_blob(const char *buffer, size_t len)
+{
+    const uint8_t *ptr = (const uint8_t *) buffer;
+    size_t h = len;
+    size_t step = (len >> 5) + 1;
+    for (size_t i = len; i >= step; i -= step)
+        h = h ^ ((h << 5) + (h >> 2) + ptr[i - 1]);
+    return h == 0 ? 1 : h;
+}
+
+xs *xs_new(xs *x, const void *p);
+// {
+//     *x = xs_literal_empty();
+//     size_t len = strlen(p) + 1;
+//     if (len > 16) {
+//         x->capacity = ilog2(len) + 1;
+//         x->size = len - 1;
+//         x->is_ptr = true;
+//         if (len < XS_INTERNING_SIZE) {
+//             x = cstr_interning(p, len - 1, hash_blob(p, len - 1));
+//         }else {
+//             xs_allocate_data(x, x->size, 0);
+//             memcpy(xs_data(x), p, len);
+//         }
+//     }else {
+//         memcpy(x->data, p, len);
+//         x->space_left = 15 - (len - 1);
+//     }
+//     return x;
+// }
 
 /* Memory leaks happen if the string is too long but it is still useful for
  * short strings.
@@ -207,7 +310,7 @@ xs *xs_new(xs *x, const void *p)
      }){1}),                                                        \
      xs_new(&xs_literal_empty(), x))
 
-/* grow up to specified size */
+/* grow up to specified size */ //modify
 xs *xs_grow(xs *x, size_t len)
 {
     char buf[16];
@@ -244,123 +347,37 @@ static inline xs *xs_free(xs *x)
     return xs_newempty(x);
 }
 
-static inline void insert_node(struct __xs_node **hash,
-                               int sz,
-                               struct __xs_node *node)
-{
-    uint32_t h = node->str.hash_size;
-    int index = h & (sz - 1);
-    node->next = hash[index];
-    hash[index] = node;
-}
-
-static void expand(struct __xs_interning *si)
-{
-    unsigned new_size = si->size * 2;
-    if (new_size < HASH_START_SIZE)
-        new_size = HASH_START_SIZE;
-
-    struct __xs_node **new_hash =
-        xalloc(sizeof(struct __xs_node *) * new_size);
-    memset(new_hash, 0, sizeof(struct __xs_node *) * new_size);
-
-    for (unsigned i = 0; i < si->size; ++i) {
-        struct __xs_node *node = si->hash[i];
-        while (node) {
-            struct __xs_node *tmp = node->next;
-            insert_node(new_hash, new_size, node);
-            node = tmp;
-        }
-    }
-
-    free(si->hash);
-    si->hash = new_hash;
-    si->size = new_size;
-}
-
-static xs *interning(struct __xs_interning *si,
-                         const char *cstr,
-                         size_t sz,
-                         uint32_t hash)
-{
-    if (!si->hash)
-        return NULL;
-
-    int index = (int) (hash & (si->size - 1));
-    struct __xs_node *n = si->hash[index];
-    while (n) {
-        if (n->str.hash_size == hash) {
-            if (!strcmp(xs_data(&n->str), cstr))
-                return &n->str;
-        }
-        n = n->next;
-    }
-    // 80% (4/5) threshold
-    if (si->total * 5 >= si->size * 4)
-        return NULL;
-    if (!si->pool) {
-        si->pool = xalloc(sizeof(struct __xs_pool));
-        si->index = 0;
-    }
-    n = &si->pool->node[si->index++];
-    memcpy(n->buffer, cstr, sz);
-    n->buffer[sz] = 0;
-
-    n->str.hash_size = hash;
-    n->str.type = CSTR_INTERNING;
-    n->str.ref = 0;
+// static bool xs_interning_cow_lazy_copy(struct __xs_interning *si, xs *x, char **data)
+// {
+//     uint32_t hash = hash_blob(xs_data(x), xs_size(x));
     
-    size_t len = strlen(n->buffer);
-    if (len < 16) {
-        strncpy(n->str.data, n->buffer, len);
-        n->str.space_left = 15 - (len - 1); 
-    }else{
-        n->str.capacity = ilog2(len) + 1;
-        n->str.size = len - 1;
-        n->str.is_ptr = true;
-        xs_allocate_data(&n->str, n->str.size, 0);
-        memcpy(xs_data(&n->str), n->buffer, len);
-    }
-    
+//     if (!si->hash)
+//         return NULL;
 
-    n->next = si->hash[index];
-    si->hash[index] = n;
+//     int index = (int) (hash & (si->size - 1));
+//     struct __xs_node *n = si->hash[index];
+//     while (n) {
+//         if (n->hash_size == hash) {
+//             if (!strcmp(xs_data(&n->str), xs_data(x))){
+//                 if(n->interning_ref <= 0)
+//                     return false;
+//                 n->interning_ref --;
+//                 xs_allocate_data(x, x->size, 0);
 
-    return &n->str;
-}
+//                 if (data) {
+//                     memcpy(xs_data(x), *data, x->size);
 
-static xs *cstr_interning(const char *cstr, size_t sz, uint32_t hash)
-{
-    xs *ret;
-    CSTR_LOCK();
-    ret = interning(&__xs_ctx, cstr, sz, hash);
-    if (!ret) {
-        expand(&__xs_ctx);
-        ret = interning(&__xs_ctx, cstr, sz, hash);
-    }
-    ++__xs_ctx.total;
-    CSTR_UNLOCK();
-    return ret;
-}
+//                     /* Update the newly allocated pointer */
+//                     *data = xs_data(x);
+//                 }
+//                 return true;
+//             }
+//         }
+//         n = n->next;
+//     }
 
-static inline uint32_t hash_blob(const char *buffer, size_t len)
-{
-    const uint8_t *ptr = (const uint8_t *) buffer;
-    size_t h = len;
-    size_t step = (len >> 5) + 1;
-    for (size_t i = len; i >= step; i -= step)
-        h = h ^ ((h << 5) + (h >> 2) + ptr[i - 1]);
-    return h == 0 ? 1 : h;
-}
-
-static size_t xs_hash(xs *s)
-{
-    if (s->type == CSTR_ONSTACK)
-        return hash_blob(xs_data(s), s->hash_size);
-    if (s->hash_size == 0)
-        s->hash_size = hash_blob(xs_data(s), strlen(xs_data(s)));
-    return s->hash_size;
-}
+//     return false;
+// }
 
 static bool xs_cow_lazy_copy(xs *x, char **data)
 {
@@ -380,6 +397,8 @@ static bool xs_cow_lazy_copy(xs *x, char **data)
     return true;
 }
 
+// backup origin node if interning than point to it and recover the backup
+
 //interning
 xs *xs_concat(xs *string, const xs *prefix, const xs *suffix)
 {
@@ -390,19 +409,25 @@ xs *xs_concat(xs *string, const xs *prefix, const xs *suffix)
          *data = xs_data(string);
 
     xs_cow_lazy_copy(string, &data);
-
+    
     if (size + pres + sufs <= capacity) {
+        if (size + pres + sufs < XS_INTERNING_SIZE) {
+            string->size = size + pres + sufs;
+            char *tmp = xalloc(string->size);
+            memcpy(tmp, pre, pres);
+            memcpy(tmp + pres, data, size);
+            memcpy(tmp + pres + size, suf, sufs + 1);
+            return cstr_interning(tmp, string->size, hash_blob(tmp, string->size));
+        }
         memmove(data + pres, data, size);
         memcpy(data, pre, pres);
         memcpy(data + pres + size, suf, sufs + 1);
         if (xs_is_ptr(string)) {
             string->size = size + pres + sufs;
-            if (size + pres + sufs < XS_INTERNING_SIZE) {
-                return cstr_interning(data, size + pres + sufs, hash_blob(data, size + pres + sufs));
-            }
         } else
             string->space_left = 15 - (size + pres + sufs);
     } else {
+        //TODO: fix grow function
         xs tmps = xs_literal_empty();
         xs_grow(&tmps, size + pres + sufs);
         char *tmpdata = xs_data(&tmps);
@@ -412,9 +437,6 @@ xs *xs_concat(xs *string, const xs *prefix, const xs *suffix)
         xs_free(string);
         *string = tmps;
         string->size = size + pres + sufs;
-        if (size + pres + sufs < XS_INTERNING_SIZE) {
-             return cstr_interning(data, size + pres + sufs, hash_blob(data, size + pres + sufs));
-        }
     }
     return string;
 }
@@ -427,9 +449,15 @@ xs *xs_trim(xs *x, const char *trimset)
 
     char *dataptr = xs_data(x), *orig = dataptr;
 
-    if (xs_cow_lazy_copy(x, &dataptr))
-        orig = dataptr;
-
+    if (xs_size(x) > 16 && xs_size(x) < XS_INTERNING_SIZE) {
+        char* tmp = xalloc(xs_size(x));
+        memcpy(tmp, dataptr, xs_size(x));
+        orig = tmp;
+    } else {
+        if (xs_cow_lazy_copy(x, &dataptr))
+            orig = dataptr;
+    }
+    
     /* similar to strspn/strpbrk but it operates on binary data */
     uint8_t mask[32] = {0};
 
@@ -461,13 +489,14 @@ xs *xs_trim(xs *x, const char *trimset)
         x->size = slen;
     else
         x->space_left = 15 - slen;
-    if (slen < XS_INTERNING_SIZE) {
-        return cstr_interning(orig, slen, hash_blob(orig, slen));
+    if (slen < XS_INTERNING_SIZE && slen > 16) {
+        x = cstr_interning(orig, slen, hash_blob(orig, slen));
     }
     return x;
 #undef check_bit
 #undef set_bit
 }
+
 // interning
 xs *xs_copy(xs *dest, xs *src){
     /* short string */
@@ -491,16 +520,7 @@ xs *xs_copy(xs *dest, xs *src){
         xs_inc_refcnt(src);
         return dest;
     } 
+    /* Medium */
     dest = xs_free(dest);
-    dest->is_ptr = 1;
-    dest->is_large_string = 0;
-    size_t len = strlen(xs_data(src)) + 1;
-    dest->capacity = ilog2(len) + 1;
-    dest->size = len - 1;
-    xs_allocate_data(dest, dest->size, 0);
-    memcpy(xs_data(dest), xs_data(src), len);
-    if (len < XS_INTERNING_SIZE) {
-        dest->ptr = cstr_interning(xs_data(src), xs_size(src), hash_blob(xs_data(src), xs_size(src)))->ptr;
-    }
-    return dest;
+    return cstr_interning(xs_data(src), xs_size(src), hash_blob(xs_data(src), xs_size(src)));
 }
