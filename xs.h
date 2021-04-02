@@ -322,15 +322,14 @@ xs *xs_grow(xs *x, size_t len)
     if (!xs_is_ptr(x))
         memcpy(buf, x->data, 16);
 
-    x->is_ptr = true;
-    x->capacity = ilog2(len) + 1;
-
     if (xs_is_ptr(x)) {
         xs_allocate_data(x, len, 1);
     } else {
         xs_allocate_data(x, len, 0);
         memcpy(xs_data(x), buf, 16);
     }
+    x->is_ptr = true;
+    x->capacity = ilog2(len) + 1;
     return x;
 }
 
@@ -346,38 +345,6 @@ static inline xs *xs_free(xs *x)
         free(x->ptr);
     return xs_newempty(x);
 }
-
-// static bool xs_interning_cow_lazy_copy(struct __xs_interning *si, xs *x, char **data)
-// {
-//     uint32_t hash = hash_blob(xs_data(x), xs_size(x));
-    
-//     if (!si->hash)
-//         return NULL;
-
-//     int index = (int) (hash & (si->size - 1));
-//     struct __xs_node *n = si->hash[index];
-//     while (n) {
-//         if (n->hash_size == hash) {
-//             if (!strcmp(xs_data(&n->str), xs_data(x))){
-//                 if(n->interning_ref <= 0)
-//                     return false;
-//                 n->interning_ref --;
-//                 xs_allocate_data(x, x->size, 0);
-
-//                 if (data) {
-//                     memcpy(xs_data(x), *data, x->size);
-
-//                     /* Update the newly allocated pointer */
-//                     *data = xs_data(x);
-//                 }
-//                 return true;
-//             }
-//         }
-//         n = n->next;
-//     }
-
-//     return false;
-// }
 
 static bool xs_cow_lazy_copy(xs *x, char **data)
 {
@@ -434,6 +401,9 @@ xs *xs_concat(xs *string, const xs *prefix, const xs *suffix)
         memcpy(tmpdata + pres, data, size);
         memcpy(tmpdata, pre, pres);
         memcpy(tmpdata + pres + size, suf, sufs + 1);
+        if (size + pres + sufs < XS_INTERNING_SIZE) {
+            return cstr_interning(tmpdata, xs_size(&tmps), hash_blob(tmpdata, xs_size(&tmps)));
+        }
         xs_free(string);
         *string = tmps;
         string->size = size + pres + sufs;
